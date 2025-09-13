@@ -1,11 +1,9 @@
-import os, warnings, gc, math
+import os, warnings, gc
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from tensorflow.keras.utils import register_keras_serializable
-from dataclasses import dataclass, asdict
 from sklearn.model_selection import GroupShuffleSplit, GroupKFold
 from sklearn.metrics import (
     mean_absolute_error, mean_squared_error, r2_score,
@@ -16,8 +14,8 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 np.set_printoptions(edgeitems=3, linewidth=120)
 
-BACKBONE_WEIGHTS = "/mnt/data/tsmamba_backbone_pretrained_MTL.ckpt"
-MODEL_DIR        = "/mnt/data/tsmamba_MTL_cv_models"
+BACKBONE_WEIGHTS = "/mnt/data/deeptcn_backbone_pretrained_MTL.h5"
+MODEL_DIR        = "/mnt/data/deeptcn_MTL_cv_models"
 OUTDIR           = "/mnt/data"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(OUTDIR, exist_ok=True)
@@ -51,16 +49,8 @@ WINDOW_FT  = DURATION_SEC * FT_HZ
 STRIDE_PRE = max(1, WINDOW_PRE // 4)
 STRIDE_FT  = max(1, WINDOW_FT  // 4)
 
-EMBED_DIM = 128
-TSM_BASE = dict(
-    model_states=32,
-    projection_expand_factor=2,
-    conv_kernel_size=4,
-    num_layers=6,
-    dropout_rate=0.2,
-    conv_use_bias=True,
-    dense_use_bias=False,
-)
+FILTERS=64; KERNEL=6; DILATIONS=(1,2,4,8,16,32); NB_STACKS=3
+DROPOUT=0.2; EMBED_DIM=128
 
 EPOCHS_PRE=40
 EPOCHS_FT_HEADS=12
@@ -156,7 +146,7 @@ def windowize_with_meta(df, features, labels, window, stride,
     dd = df.sort_values(sort_cols) if sort_cols else df.copy()
 
     gkeys = [c for c in [id_col, cond_col] if c in dd.columns]
-    iterator = dd.groupby(gkeys, sort=False) if gkeys else [(("none","none"), dd)]
+    iterator = dd.groupby(gkeys, sort=False) if gkeys else [(('none','none'), dd)]
 
     X, Ys = [], [[] for _ in labels]
     meta_rows = []
@@ -169,7 +159,7 @@ def windowize_with_meta(df, features, labels, window, stride,
             if l is None or l not in g.columns:
                 labs.append(np.full(len(g), np.nan, dtype=float))
             else:
-                labs.append(pd.to_numeric(g[l], errors="coerce").to_numpy(dtype=float))
+                labs.append(pd.to_numeric(g[l], errors='coerce').to_numpy(dtype=float))
 
         n = len(g)
         if n < window: continue
@@ -208,185 +198,51 @@ def drop_nan_windows(X, *ys, meta=None):
         out.append(meta)
     return tuple(out)
 
-@dataclass
-class TSMArgs:
-    model_input_dims: int = 64
-    model_states: int = 64
-    projection_expand_factor: int = 2
-    conv_kernel_size: int = 4
-    num_layers: int = 6
-    dropout_rate: float = 0.2
-    conv_use_bias: bool = True
-    dense_use_bias: bool = False
-    delta_t_rank: int = None
+def _fallback_tcn_stack(x, nb_filters, kernel_size, dilations, nb_stacks, dropout):
+    def TCNBlock(x, filters, k, d, drop):
+        skip = x
+        x = layers.Conv1D(filters, k, padding="causal", dilation_rate=d)(x)
+        x = layers.BatchNormalization()(x); x = layers.ReLU()(x)
+        x = layers.SpatialDropout1D(drop)(x)
+        x = layers.Conv1D(filters, k, padding="causal", dilation_rate=d)(x)
+        x = layers.BatchNormalization()(x)
+        if skip.shape[-1] != filters:
+            skip = layers.Conv1D(filters, 1, padding="same")(skip)
+        x = layers.Add()([x, skip]); x = layers.ReLU()(x)
+        return x
+    for _ in range(nb_stacks):
+        for d in dilations:
+            x = TCNBlock(x, nb_filters, kernel_size, d, dropout)
+    return x
 
-    def finalize(self):
-        if self.delta_t_rank is None:
-            self.delta_t_rank = math.ceil(self.model_input_dims/16)
-        self.model_internal_dim = int(self.projection_expand_factor * self.model_input_dims)
-        return self
-
-def selective_scan(u, delta, A, B, C, D):
-    dA   = tf.einsum('bld,dn->bldn', delta, A)
-    dB_u = tf.einsum('bld,bld,bln->bldn', delta, u, B)
-
-    dA_cumsum = tf.pad(dA[:, 1:], [[0,0],[1,1],[0,0],[0,0]])[:, 1:,:,:]
-    dA_cumsum = tf.reverse(dA_cumsum, axis=[1])
-    dA_cumsum = tf.math.cumsum(dA_cumsum, axis=1)
-    dA_cumsum = tf.exp(dA_cumsum)
-    dA_cumsum = tf.reverse(dA_cumsum, axis=[1])
-
-    x = dB_u * dA_cumsum
-    x = tf.math.cumsum(x, axis=1) / (dA_cumsum + 1e-12)
-
-    y = tf.einsum('bldn,bln->bld', x, C)
-    return y + u * D
-
-@register_keras_serializable(package="tsmamba")
-class MambaBlock(layers.Layer):
-    def __init__(self, args: TSMArgs, *a, **k):
-        super().__init__(*a, **k)
-        self.args = args.finalize()
-
-        self.in_projection = layers.Dense(
-            self.args.model_internal_dim * 2,
-            input_shape=(self.args.model_input_dims,), use_bias=False, name="in_proj"
-        )
-
-        self.groups_supported = 'groups' in layers.Conv1D.__init__.__code__.co_varnames
-        if self.groups_supported:
-            self.conv1d = layers.Conv1D(
-                filters=self.args.model_internal_dim,
-                kernel_size=self.args.conv_kernel_size,
-                padding='causal',
-                groups=self.args.model_internal_dim,
-                use_bias=self.args.conv_use_bias,
-                data_format='channels_last',
-                name="dw_conv1d"
-            )
-        else:
-            self.conv1d = layers.SeparableConv1D(
-                filters=self.args.model_internal_dim,
-                kernel_size=self.args.conv_kernel_size,
-                padding='causal',
-                use_bias=self.args.conv_use_bias,
-                name="sep_conv1d_fallback"
-            )
-
-        self.x_projection = layers.Dense(
-            self.args.delta_t_rank + self.args.model_states * 2,
-            use_bias=False, name="x_proj"
-        )
-        self.delta_t_projection = layers.Dense(
-            self.args.model_internal_dim, use_bias=True, name="delta_proj"
-        )
-
-        base = tf.range(1, self.args.model_states + 1, dtype=tf.float32)
-        A_init = tf.tile(tf.expand_dims(base, axis=0), [self.args.model_internal_dim, 1])
-        self.A_log = tf.Variable(tf.math.log(A_init), trainable=True, dtype=tf.float32, name="SSM_A_log")
-        self.D     = tf.Variable(np.ones(self.args.model_internal_dim), trainable=True, dtype=tf.float32, name="SSM_D")
-
-        self.out_projection = layers.Dense(
-            self.args.model_input_dims,
-            input_shape=(self.args.model_internal_dim,),
-            use_bias=self.args.dense_use_bias, name="out_proj"
-        )
-
-    def call(self, x):
-        x_and_res = self.in_projection(x)
-        x_int, res = tf.split(x_and_res, 2, axis=-1)
-
-        xc = self.conv1d(x_int)
-        L = tf.shape(x_int)[1]
-        xc = xc[:, :L, :]
-        xc = tf.nn.swish(xc)
-
-        y = self.ssm(xc)
-        y = y * tf.nn.swish(res)
-        return self.out_projection(y)
-
-    def ssm(self, x):
-        d_int, n = self.A_log.shape
-        A = -tf.exp(tf.cast(self.A_log, tf.float32))
-        D = tf.cast(self.D, tf.float32)
-
-        x_dbl = self.x_projection(x)
-        delta, B, C = tf.split(x_dbl, [self.args.delta_t_rank, n, n], axis=-1)
-        delta = tf.nn.softplus(self.delta_t_projection(delta))
-
-        return selective_scan(x, delta, A, B, C, D)
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"args": asdict(self.args)})
-        return cfg
-
-    @classmethod
-    def from_config(cls, config):
-        args_dict = config.pop("args")
-        args = TSMArgs(**args_dict).finalize()
-        return cls(args=args, **config)
-
-@register_keras_serializable(package="tsmamba")
-class ResidualBlock(layers.Layer):
-    def __init__(self, args: TSMArgs, *a, **k):
-        super().__init__(*a, **k)
-        self.args = args.finalize()
-        self.norm = layers.LayerNormalization(epsilon=1e-5, name="ln")
-        self.mixer = MambaBlock(self.args)
-        self.drop  = layers.Dropout(self.args.dropout_rate, name="drop")
-
-    def call(self, x):
-        return self.drop(self.mixer(self.norm(x)) + x)
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"args": asdict(self.args)})
-        return cfg
-
-    @classmethod
-    def from_config(cls, config):
-        args_dict = config.pop("args")
-        args = TSMArgs(**args_dict).finalize()
-        return cls(args=args, **config)
-
-def TSMambaBackboneModel(input_shape, tsm_args: TSMArgs, embed_dim=EMBED_DIM):
-    """
-    Maps [B,T,F] -> [B,embed_dim]
-    """
+def build_backbone(input_shape,
+                   nb_filters=FILTERS,
+                   kernel_size=KERNEL,
+                   dilations=DILATIONS,
+                   nb_stacks=NB_STACKS,
+                   dropout_rate=DROPOUT,
+                   embed_dim=EMBED_DIM):
     inp = layers.Input(shape=input_shape, name="input")
-    args_local = TSMArgs(
-        model_input_dims=input_shape[1],
-        model_states=tsm_args.model_states,
-        projection_expand_factor=tsm_args.projection_expand_factor,
-        conv_kernel_size=tsm_args.conv_kernel_size,
-        num_layers=tsm_args.num_layers,
-        dropout_rate=tsm_args.dropout_rate,
-        conv_use_bias=tsm_args.conv_use_bias,
-        dense_use_bias=tsm_args.dense_use_bias,
-    ).finalize()
+    try:
+        from tcn import TCN
+        x = TCN(
+            nb_filters=nb_filters,
+            kernel_size=kernel_size,
+            dilations=list(dilations),
+            nb_stacks=NB_STACKS,
+            use_skip_connections=True,
+            use_batch_norm=True,
+            dropout_rate=dropout_rate,
+            return_sequences=False,
+            name="backbone_tcn",
+        )(inp)
+    except Exception:
+        x = _fallback_tcn_stack(inp, nb_filters, kernel_size, list(dilations), nb_stacks, dropout_rate)
+        x = layers.GlobalAveragePooling1D()(x)
 
-    x = inp
-    for i in range(args_local.num_layers):
-        x = ResidualBlock(args_local, name=f"Residual_{i}")(x)
-    x = layers.LayerNormalization(epsilon=1e-5, name="pre_head_norm")(x)
-    x = layers.GlobalAveragePooling1D(name="gap")(x)
-    x = layers.Dense(embed_dim, activation="relu", name="embed")(x)
+    x = layers.Dense(EMBED_DIM, activation="relu", name="embed")(x)
     x = layers.Dropout(0.2)(x)
-    return keras.Model(inp, x, name="TSMambaBackbone")
-
-def build_backbone(input_shape, tsm_base=TSM_BASE, embed_dim=EMBED_DIM):
-    args = TSMArgs(
-        model_input_dims=input_shape[1],
-        model_states=tsm_base["model_states"],
-        projection_expand_factor=tsm_base["projection_expand_factor"],
-        conv_kernel_size=tsm_base["conv_kernel_size"],
-        num_layers=tsm_base["num_layers"],
-        dropout_rate=tsm_base["dropout_rate"],
-        conv_use_bias=tsm_base["conv_use_bias"],
-        dense_use_bias=tsm_base["dense_use_bias"],
-    )
-    return TSMambaBackboneModel(input_shape, args, embed_dim=embed_dim)
+    return keras.Model(inp, x, name="DeepTCN")
 
 def build_pre_model_regression(input_shape):
     bb = build_backbone(input_shape)
@@ -400,20 +256,12 @@ def build_multitask_model(backbone):
     y3 = layers.Dense(1, activation="linear", name="y3")(x)
     return keras.Model(backbone.input, [y1, y2, y3], name="MTL_y1reg_y2bin_y3reg")
 
-def set_trainable_recursive(layer, flag):
-    layer.trainable = flag
-    if hasattr(layer, "layers"):
-        for sub in layer.layers:
-            set_trainable_recursive(sub, flag)
-
-def freeze_backbone(backbone, trainable=False):
-    set_trainable_recursive(backbone, trainable)
-
-def unfreeze_last_residual_blocks(backbone, n_blocks=4):
-    freeze_backbone(backbone, trainable=False)
-    resid_layers = [L for L in backbone.layers if L.name.startswith("Residual_")]
-    for L in resid_layers[-n_blocks:]:
-        set_trainable_recursive(L, True)
+def unfreeze_last_n(backbone, n):
+    for L in backbone.layers:
+        L.trainable = False
+    elig = [L for L in backbone.layers if isinstance(L, (layers.Conv1D, layers.BatchNormalization, layers.Dense))]
+    for L in elig[-n:]:
+        L.trainable = True
 
 pre_df = pdf
 ft_df  = fdf
@@ -503,7 +351,6 @@ fold_id = 0
 for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
     fold_id += 1
     print(f"\n===================== Fold {fold_id}/{K_FOLDS} =====================")
-
     tr_groups = groups[tr_index]
     gss_inner = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=SEED+fold_id)
     tr_sub_idx, va_sub_idx = next(gss_inner.split(tr_index, groups=tr_groups))
@@ -527,8 +374,8 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
 
     if LOAD_PRETRAINED:
         try:
-            bb_ft.load_weights(BACKBONE_WEIGHTS)
-            print("Loaded pretrained TS-Mamba backbone weights.")
+            bb_ft.load_weights(BACKBONE_WEIGHTS, by_name=True, skip_mismatch=True)
+            print("Loaded pretrained backbone weights.")
         except Exception as e:
             print("Warning: could not load backbone weights:", e)
 
@@ -537,7 +384,7 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
     cw_y2 = class_weights_binary(y2_tr)
     sw_y2_tr = np.array([cw_y2[int(v)] for v in y2_tr], dtype=np.float32)
 
-    freeze_backbone(bb_ft, trainable=False)
+    for L in bb_ft.layers: L.trainable = False
     mt.compile(
         optimizer=keras.optimizers.Adam(3e-3),
         loss={'y1': keras.losses.Huber(delta=1.0),
@@ -555,7 +402,9 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
         epochs=EPOCHS_FT_HEADS, batch_size=BATCH, verbose=1
     )
 
-    unfreeze_last_residual_blocks(bb_ft, n_blocks=4)
+    def unfreeze_last_trainable_layers(backbone, n_last=12):
+        unfreeze_last_n(backbone, n_last)
+    unfreeze_last_trainable_layers(bb_ft, n_last=12)
     mt.compile(
         optimizer=keras.optimizers.Adam(1e-3),
         loss={'y1': keras.losses.Huber(delta=1.0),
@@ -573,7 +422,7 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
         epochs=EPOCHS_FT_LAST, batch_size=BATCH, verbose=1
     )
 
-    freeze_backbone(bb_ft, trainable=True)
+    for L in bb_ft.layers: L.trainable = True
     mt.compile(
         optimizer=keras.optimizers.Adam(5e-4),
         loss={'y1': keras.losses.Huber(delta=1.0),
@@ -591,9 +440,9 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
         epochs=EPOCHS_FT_ALL, batch_size=BATCH, verbose=1
     )
 
-    model_dir_fold = os.path.join(MODEL_DIR, f"tsmamba_MTL_fold{fold_id}")
-    mt.save(model_dir_fold)
-    print("Saved fold model (SavedModel):", model_dir_fold)
+    model_path_fold = os.path.join(MODEL_DIR, f"deeptcn_MTL_fold{fold_id}.keras")
+    mt.save(model_path_fold)
+    print("Saved fold model:", model_path_fold)
 
     y1p, y2p, y3p = mt.predict(X_te, batch_size=BATCH, verbose=0)
     y1_pred = np.clip(y1p.ravel(), 0.0, 10.0)
@@ -607,7 +456,7 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
     )
     _ = eval_regression_with_plots(
         y3_te_raw, y3_pred,
-        title_prefix=f"Fold{fold_id}_y3_blur_label",
+        title_prefix=f"Fold{fold_id}_y3_blur_level",
         outdir=OUTDIR, scatter_kind=SCATTER_KIND
     )
 
@@ -618,18 +467,12 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
     mae1 = mean_absolute_error(y1_te, y1_pred)
     rmse1 = np.sqrt(mean_squared_error(y1_te, y1_pred))
     r21   = r2_score(y1_te, y1_pred)
-    r1 = (
-    np.corrcoef(y1_te.ravel(), y1_pred.ravel())[0, 1]
-    if (np.std(y1_te) > 0 and np.std(y1_pred) > 0)
-    else np.nan)
+    r1    = np.corrcoef(y1_te, y1_pred)[0,1] if (np.std(y1_te)>0 and np.std(y1_pred)>0) else np.nan
 
     mae3 = mean_absolute_error(y3_te_raw, y3_pred)
     rmse3 = np.sqrt(mean_squared_error(y3_te_raw, y3_pred))
     r23   = r2_score(y3_te_raw, y3_pred)
-    r3 = (
-    np.corrcoef(y3_te_raw.ravel(), y3_pred.ravel())[0, 1]
-    if (np.std(y3_te_raw) > 0 and np.std(y3_pred) > 0)
-    else np.nan)
+    r3    = np.corrcoef(y3_te_raw, y3_pred)[0,1] if (np.std(y3_te_raw)>0 and np.std(y3_pred)>0) else np.nan
 
     acc2 = accuracy_score(y2_te, y2_hat)
 

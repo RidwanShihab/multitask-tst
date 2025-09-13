@@ -4,7 +4,7 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from tensorflow.keras.utils import register_keras_serializable
+from tensorflow.keras.utils import register_keras_serializable, get_custom_objects
 from dataclasses import dataclass, asdict
 from sklearn.model_selection import GroupShuffleSplit, GroupKFold
 from sklearn.metrics import (
@@ -16,13 +16,11 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 np.set_printoptions(edgeitems=3, linewidth=120)
 
-BACKBONE_WEIGHTS = "/mnt/data/tsmamba_backbone_pretrained_MTL.ckpt"
-MODEL_DIR        = "/mnt/data/tsmamba_MTL_cv_models"
-OUTDIR           = "/mnt/data"
+MODEL_DIR  = "/mnt/data/tsmamba_MTL_cv_models"
+OUTDIR     = "/mnt/data"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(OUTDIR, exist_ok=True)
 
-LOAD_PRETRAINED = True
 SCATTER_KIND = "hexbin"
 
 FEATURES = [
@@ -34,7 +32,7 @@ FEATURES = [
     'Left_GazeDir_X','Left_GazeDir_Y','Left_GazeDir_Z',
     'Right_GazeDir_X','Right_GazeDir_Y','Right_GazeDir_Z'
 ]
-ID_COL    = "participant_id"
+ID_COL   = "participant_id"
 COND_COL  = "condition"
 TIME_COL  = "Timestamp"
 
@@ -43,13 +41,9 @@ Y2_COL = "blur_effectiveness"
 Y3_COL = "blur_label"
 
 DURATION_SEC = 3
-PRE_HZ = 2
 FT_HZ  = 5
-
-WINDOW_PRE = DURATION_SEC * PRE_HZ
 WINDOW_FT  = DURATION_SEC * FT_HZ
-STRIDE_PRE = max(1, WINDOW_PRE // 4)
-STRIDE_FT  = max(1, WINDOW_FT  // 4)
+STRIDE_FT  = max(1, WINDOW_FT // 4)
 
 EMBED_DIM = 128
 TSM_BASE = dict(
@@ -62,17 +56,14 @@ TSM_BASE = dict(
     dense_use_bias=False,
 )
 
-EPOCHS_PRE=40
-EPOCHS_FT_HEADS=12
-EPOCHS_FT_LAST=20
-EPOCHS_FT_ALL=60
-BATCH=64
+EPOCHS = 90
+BATCH  = 64
 
 K_FOLDS = 10
 
-VAL_SIZE=0.15
-TEST_SIZE=0.15
-SEED=42
+VAL_SIZE  = 0.15
+TEST_SIZE = 0.15
+SEED = 42
 np.random.seed(SEED); tf.random.set_seed(SEED)
 
 def eval_regression_with_plots(y_true, y_pred, title_prefix, outdir=OUTDIR, scatter_kind="scatter"):
@@ -81,7 +72,10 @@ def eval_regression_with_plots(y_true, y_pred, title_prefix, outdir=OUTDIR, scat
     mae  = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2   = r2_score(y_true, y_pred)
-    pearson = np.corrcoef(y_true, y_pred)[0,1] if (np.std(y_true)>0 and np.std(y_pred)>0) else np.nan
+    pearson = (
+        np.corrcoef(y_true, y_pred)[0,1]
+        if (np.std(y_true)>0 and np.std(y_pred)>0) else np.nan
+    )
     print(f"{title_prefix}: MAE={mae:.4f} | RMSE={rmse:.4f} | R^2={r2:.4f} | r={pearson:.4f}")
 
     fig, ax = plt.subplots(figsize=(4.8, 4.2))
@@ -207,6 +201,9 @@ def drop_nan_windows(X, *ys, meta=None):
         meta = meta.loc[m].reset_index(drop=True)
         out.append(meta)
     return tuple(out)
+
+get_custom_objects().pop("tsmamba>MambaBlock", None)
+get_custom_objects().pop("tsmamba>ResidualBlock", None)
 
 @dataclass
 class TSMArgs:
@@ -351,9 +348,6 @@ class ResidualBlock(layers.Layer):
         return cls(args=args, **config)
 
 def TSMambaBackboneModel(input_shape, tsm_args: TSMArgs, embed_dim=EMBED_DIM):
-    """
-    Maps [B,T,F] -> [B,embed_dim]
-    """
     inp = layers.Input(shape=input_shape, name="input")
     args_local = TSMArgs(
         model_input_dims=input_shape[1],
@@ -388,11 +382,6 @@ def build_backbone(input_shape, tsm_base=TSM_BASE, embed_dim=EMBED_DIM):
     )
     return TSMambaBackboneModel(input_shape, args, embed_dim=embed_dim)
 
-def build_pre_model_regression(input_shape):
-    bb = build_backbone(input_shape)
-    y1 = layers.Dense(1, activation="linear", name="y1")(bb.output)
-    return keras.Model(bb.input, y1, name="PretrainRegY1"), bb
-
 def build_multitask_model(backbone):
     x  = backbone.output
     y1 = layers.Dense(1, activation="linear", name="y1")(x)
@@ -400,80 +389,21 @@ def build_multitask_model(backbone):
     y3 = layers.Dense(1, activation="linear", name="y3")(x)
     return keras.Model(backbone.input, [y1, y2, y3], name="MTL_y1reg_y2bin_y3reg")
 
-def set_trainable_recursive(layer, flag):
-    layer.trainable = flag
-    if hasattr(layer, "layers"):
-        for sub in layer.layers:
-            set_trainable_recursive(sub, flag)
-
-def freeze_backbone(backbone, trainable=False):
-    set_trainable_recursive(backbone, trainable)
-
-def unfreeze_last_residual_blocks(backbone, n_blocks=4):
-    freeze_backbone(backbone, trainable=False)
-    resid_layers = [L for L in backbone.layers if L.name.startswith("Residual_")]
-    for L in resid_layers[-n_blocks:]:
-        set_trainable_recursive(L, True)
-
-pre_df = pdf
-ft_df  = fdf
+ft_df = fdf
 
 FEATURES = drop_quasi_constant(ft_df, FEATURES, thr=1e-6)
-FEATURES = drop_quasi_constant(pre_df, FEATURES, thr=1e-6)
 print("Using FEATURES:", FEATURES)
 
 if TIME_COL in ft_df.columns:
     ft_df[TIME_COL] = pd.to_datetime(ft_df[TIME_COL], errors="coerce")
 
-X1_all, [y1_all], meta1 = windowize_with_meta(
-    pre_df, FEATURES, [Y1_COL],
-    window=WINDOW_PRE, stride=STRIDE_PRE,
-    id_col=ID_COL, cond_col=COND_COL, time_col=None,
-    block_len=WINDOW_PRE
-)
-X1_all, y1_all, meta1 = drop_nan_windows(X1_all, y1_all, meta=meta1)
-
-gss1 = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=SEED)
-idx_all = np.arange(len(meta1))
-trainval_idx, test_idx = next(gss1.split(idx_all, groups=meta1["block_id"].values))
-gss2 = GroupShuffleSplit(n_splits=1, test_size=VAL_SIZE/(1.0 - TEST_SIZE), random_state=SEED)
-train_idx, val_idx = next(gss2.split(trainval_idx, groups=meta1["block_id"].values[trainval_idx]))
-train_idx = trainval_idx[train_idx]; val_idx = trainval_idx[val_idx]
-
-X1_tr, X1_va, X1_te = X1_all[train_idx], X1_all[val_idx], X1_all[test_idx]
-y1_tr, y1_va, y1_te = y1_all[train_idx], y1_all[val_idx], y1_all[test_idx]
-
-z1 = zclip_fit(X1_tr); X1_tr = z1(X1_tr); X1_va = z1(X1_va); X1_te = z1(X1_te)
-m1 = minmax_fit(X1_tr); X1_tr = m1(X1_tr); X1_va = m1(X1_va); X1_te = m1(X1_te)
-
-input_shape_pre = (X1_tr.shape[1], X1_tr.shape[2])
-model_pre, backbone = build_pre_model_regression(input_shape_pre)
-model_pre.compile(
-    optimizer=keras.optimizers.Adam(1e-3),
-    loss=keras.losses.Huber(delta=1.0),
-    metrics=[keras.metrics.MeanAbsoluteError(name="MAE")]
-)
-_ = model_pre.fit(
-    X1_tr, y1_tr,
-    validation_data=(X1_va, y1_va),
-    epochs=EPOCHS_PRE, batch_size=BATCH, verbose=1
-)
-backbone.save_weights(BACKBONE_WEIGHTS)
-
-y1_pred_te_pre = model_pre.predict(X1_te, batch_size=BATCH, verbose=0).ravel()
-_ = eval_regression_with_plots(
-    y1_te, y1_pred_te_pre,
-    title_prefix="Pretrain_y1_fms",
-    outdir=OUTDIR, scatter_kind=SCATTER_KIND
-)
-
-X2_all, [y1f_all, y2_all, y3_all], meta2 = windowize_with_meta(
+X_all, [y1_all, y2_all, y3_all], meta = windowize_with_meta(
     ft_df, FEATURES, [Y1_COL, Y2_COL, Y3_COL],
     window=WINDOW_FT, stride=STRIDE_FT,
     id_col=ID_COL, cond_col=COND_COL, time_col=(TIME_COL if TIME_COL in ft_df.columns else None),
     block_len=WINDOW_FT
 )
-X2_all, y1f_all, y2_all, y3_all, meta2 = drop_nan_windows(X2_all, y1f_all, y2_all, y3_all, meta=meta2)
+X_all, y1_all, y2_all, y3_all, meta = drop_nan_windows(X_all, y1_all, y2_all, y3_all, meta=meta)
 y2_all = y2_all.astype(int)
 
 y3_scale = 10.0
@@ -481,7 +411,7 @@ y3_all_raw = y3_all.copy()
 y3_all = y3_all / y3_scale
 
 gkf = GroupKFold(n_splits=K_FOLDS)
-groups = meta2["block_id"].values
+groups = meta["block_id"].values
 fold_metrics = {
     "y1_MAE": [], "y1_RMSE": [], "y1_R2": [], "y1_r": [],
     "y3_MAE": [], "y3_RMSE": [], "y3_R2": [], "y3_r": [],
@@ -500,10 +430,9 @@ def summarize(name, vals):
     return f"{name}: {vals.mean():.4f} ± {vals.std(ddof=1):.4f}  (per-fold: {', '.join(f'{v:.4f}' for v in vals)})"
 
 fold_id = 0
-for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
+for tr_index, te_index in gkf.split(X_all, y1_all, groups=groups):
     fold_id += 1
     print(f"\n===================== Fold {fold_id}/{K_FOLDS} =====================")
-
     tr_groups = groups[tr_index]
     gss_inner = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=SEED+fold_id)
     tr_sub_idx, va_sub_idx = next(gss_inner.split(tr_index, groups=tr_groups))
@@ -511,51 +440,24 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
     va_idx = tr_index[va_sub_idx]
     te_idx = te_index
 
-    X_tr, X_va, X_te = X2_all[tr_idx], X2_all[va_idx], X2_all[te_idx]
-    y1_tr, y1_va, y1_te = y1f_all[tr_idx], y1f_all[va_idx], y1f_all[te_idx]
+    X_tr, X_va, X_te = X_all[tr_idx], X_all[va_idx], X_all[te_idx]
+    y1_tr, y1_va, y1_te = y1_all[tr_idx], y1_all[va_idx], y1_all[te_idx]
     y2_tr, y2_va, y2_te = y2_all[tr_idx], y2_all[va_idx], y2_all[te_idx]
     y3_tr, y3_va, y3_te = y3_all[tr_idx], y3_all[va_idx], y3_all[te_idx]
     y3_te_raw = y3_all_raw[te_idx]
 
-    z2 = zclip_fit(X_tr); X_tr = z2(X_tr); X_va = z2(X_va); X_te = z2(X_te)
-    m2 = minmax_fit(X_tr); X_tr = m2(X_tr); X_va = m2(X_va); X_te = m2(X_te)
+    zf = zclip_fit(X_tr); X_tr = zf(X_tr); X_va = zf(X_va); X_te = zf(X_te)
+    mf = minmax_fit(X_tr); X_tr = mf(X_tr); X_va = mf(X_va); X_te = mf(X_te)
 
     keras.backend.clear_session()
     gc.collect()
-    input_shape_ft = (X_tr.shape[1], X_tr.shape[2])
-    bb_ft = build_backbone(input_shape_ft)
-
-    if LOAD_PRETRAINED:
-        try:
-            bb_ft.load_weights(BACKBONE_WEIGHTS)
-            print("Loaded pretrained TS-Mamba backbone weights.")
-        except Exception as e:
-            print("Warning: could not load backbone weights:", e)
-
-    mt = build_multitask_model(bb_ft)
+    input_shape = (X_tr.shape[1], X_tr.shape[2])
+    backbone = build_backbone(input_shape)
+    mt = build_multitask_model(backbone)
 
     cw_y2 = class_weights_binary(y2_tr)
     sw_y2_tr = np.array([cw_y2[int(v)] for v in y2_tr], dtype=np.float32)
 
-    freeze_backbone(bb_ft, trainable=False)
-    mt.compile(
-        optimizer=keras.optimizers.Adam(3e-3),
-        loss={'y1': keras.losses.Huber(delta=1.0),
-              'y2': 'sparse_categorical_crossentropy',
-              'y3': keras.losses.Huber(delta=1.0)},
-        loss_weights={'y1': 1.0, 'y2': 1.0, 'y3': 1.0},
-        metrics={'y1': [keras.metrics.MeanAbsoluteError(name="MAE")],
-                 'y2': ['sparse_categorical_accuracy'],
-                 'y3': [keras.metrics.MeanAbsoluteError(name="MAE")]}
-    )
-    _ = mt.fit(
-        X_tr, {'y1': y1_tr, 'y2': y2_tr, 'y3': y3_tr},
-        sample_weight={'y2': sw_y2_tr},
-        validation_data=(X_va, {'y1': y1_va, 'y2': y2_va, 'y3': y3_va}),
-        epochs=EPOCHS_FT_HEADS, batch_size=BATCH, verbose=1
-    )
-
-    unfreeze_last_residual_blocks(bb_ft, n_blocks=4)
     mt.compile(
         optimizer=keras.optimizers.Adam(1e-3),
         loss={'y1': keras.losses.Huber(delta=1.0),
@@ -570,30 +472,12 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
         X_tr, {'y1': y1_tr, 'y2': y2_tr, 'y3': y3_tr},
         sample_weight={'y2': sw_y2_tr},
         validation_data=(X_va, {'y1': y1_va, 'y2': y2_va, 'y3': y3_va}),
-        epochs=EPOCHS_FT_LAST, batch_size=BATCH, verbose=1
-    )
-
-    freeze_backbone(bb_ft, trainable=True)
-    mt.compile(
-        optimizer=keras.optimizers.Adam(5e-4),
-        loss={'y1': keras.losses.Huber(delta=1.0),
-              'y2': 'sparse_categorical_crossentropy',
-              'y3': keras.losses.Huber(delta=1.0)},
-        loss_weights={'y1': 1.0, 'y2': 1.0, 'y3': 1.0},
-        metrics={'y1': [keras.metrics.MeanAbsoluteError(name="MAE")],
-                 'y2': ['sparse_categorical_accuracy'],
-                 'y3': [keras.metrics.MeanAbsoluteError(name="MAE")]}
-    )
-    _ = mt.fit(
-        X_tr, {'y1': y1_tr, 'y2': y2_tr, 'y3': y3_tr},
-        sample_weight={'y2': sw_y2_tr},
-        validation_data=(X_va, {'y1': y1_va, 'y2': y2_va, 'y3': y3_va}),
-        epochs=EPOCHS_FT_ALL, batch_size=BATCH, verbose=1
+        epochs=EPOCHS, batch_size=BATCH, verbose=1
     )
 
     model_dir_fold = os.path.join(MODEL_DIR, f"tsmamba_MTL_fold{fold_id}")
     mt.save(model_dir_fold)
-    print("Saved fold model (SavedModel):", model_dir_fold)
+    print("Saved fold model:", model_dir_fold)
 
     y1p, y2p, y3p = mt.predict(X_te, batch_size=BATCH, verbose=0)
     y1_pred = np.clip(y1p.ravel(), 0.0, 10.0)
@@ -607,7 +491,7 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
     )
     _ = eval_regression_with_plots(
         y3_te_raw, y3_pred,
-        title_prefix=f"Fold{fold_id}_y3_blur_label",
+        title_prefix=f"Fold{fold_id}_y3_blur_level",
         outdir=OUTDIR, scatter_kind=SCATTER_KIND
     )
 
@@ -619,17 +503,17 @@ for tr_index, te_index in gkf.split(X2_all, y1f_all, groups=groups):
     rmse1 = np.sqrt(mean_squared_error(y1_te, y1_pred))
     r21   = r2_score(y1_te, y1_pred)
     r1 = (
-    np.corrcoef(y1_te.ravel(), y1_pred.ravel())[0, 1]
-    if (np.std(y1_te) > 0 and np.std(y1_pred) > 0)
-    else np.nan)
+        np.corrcoef(y1_te.ravel(), y1_pred.ravel())[0, 1]
+        if (np.std(y1_te) > 0 and np.std(y1_pred) > 0) else np.nan
+    )
 
     mae3 = mean_absolute_error(y3_te_raw, y3_pred)
     rmse3 = np.sqrt(mean_squared_error(y3_te_raw, y3_pred))
     r23   = r2_score(y3_te_raw, y3_pred)
     r3 = (
-    np.corrcoef(y3_te_raw.ravel(), y3_pred.ravel())[0, 1]
-    if (np.std(y3_te_raw) > 0 and np.std(y3_pred) > 0)
-    else np.nan)
+        np.corrcoef(y3_te_raw.ravel(), y3_pred.ravel())[0, 1]
+        if (np.std(y3_te_raw) > 0 and np.std(y3_pred) > 0) else np.nan
+    )
 
     acc2 = accuracy_score(y2_te, y2_hat)
 
@@ -645,7 +529,7 @@ def summarize(name, vals):
     vals = np.array(vals, dtype=float)
     return f"{name}: {vals.mean():.4f} ± {vals.std(ddof=1):.4f}  (per-fold: {', '.join(f'{v:.4f}' for v in vals)})"
 
-print("\n===================== {K_FOLDS}-fold CV Summary (finetune dataset) =====================")
+print(f"\n===================== {K_FOLDS}-fold CV Summary (finetune dataset) =====================")
 print(summarize("y1 MAE",  fold_metrics["y1_MAE"]))
 print(summarize("y1 RMSE", fold_metrics["y1_RMSE"]))
 print(summarize("y1 R2",   fold_metrics["y1_R2"]))
